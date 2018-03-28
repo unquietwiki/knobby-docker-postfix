@@ -1,0 +1,82 @@
+#!/bin/bash
+
+set -e
+
+_log() {
+    local logfile=/var/log/mail.log
+    if [ ! -f $logfile ]; then
+        touch $logfile
+        chmod 640 $logfile
+    fi
+    echo "$(date '+%b %e %H:%I:%S') $(hostname) entrypoint[$$]: $1" >> $logfile
+}
+
+_stop() {
+    /etc/init.d/postfix stop
+    /etc/init.d/rsyslog stop
+    _log "Docker entrypoint stop"
+}
+
+trap "_stop" SIGINT SIGTERM SIGHUP
+
+_log "Docker entrypoint start"
+
+if [ -n "$SRC_NETWORKS" ]; then
+    /usr/sbin/postconf -e mynetworks="$SRC_NETWORKS"
+    /usr/sbin/postconf -e inet_interfaces=all
+fi
+
+# Set host & domain name
+# MAILNAME set per https://serverfault.com/questions/373167/postfix-system-mail-name
+if [ -n "$EXT_HOST" ]; then
+    /usr/sbin/postconf -e myhostname=$EXT_HOST
+    printf "$EXT_HOST" > /etc/mailname
+fi
+if [ -n "$EXT_DOMAIN" ]; then
+    /usr/sbin/postconf -e mydomain=$EXT_DOMAIN
+    printf ".$EXT_DOMAIN" >> /etc/mailname
+fi
+
+# Set destination
+if [ -n "$LOCAL_DELIVER" ]; then /usr/sbin/postconf -e mydestination=$LOCAL_DELIVER; fi
+
+# Email size limits
+if [ -n "$MESSAGE_SIZE_LIMIT" ]; then
+    /usr/sbin/postconf -e message_size_limit=$MESSAGE_SIZE_LIMIT
+fi
+
+# Mail relay host
+if [ -n "$MAIL_RELAY_HOST" ] && [ -n "$MAIL_RELAY_PORT" ]; then
+    /usr/sbin/postconf -e relayhost="$MAIL_RELAY_HOST:$MAIL_RELAY_PORT";
+    printf "$MAIL_RELAY_HOST:$MAIL_RELAY_PORT $MAIL_RELAY_USER:$MAIL_RELAY_PASS\n" >> /etc/postfix/sasl/sasl_passwd;
+fi
+if [ -n "$MAIL_DELIVERY_HOST" ] && [ -n "$MAIL_DELIVERY_PORT" ]; then
+    printf "$MAIL_DELIVERY_HOST:$MAIL_DELIVERY_PORT $MAIL_DELIVERY_USER:$MAIL_DELIVERY_PASS\n" >> /etc/postfix/sasl/sasl_passwd;
+fi
+/usr/sbin/postmap /etc/postfix/sasl/sasl_passwd
+
+# Configure SMTPS wrapping if port is 465
+if [ "$MAIL_RELAY_PORT" == "465" ]; then
+    /usr/sbin/postconf -e smtp_tls_wrappermode=yes
+    /usr/sbin/postconf -e smtp_tls_security_level=encrypt
+fi
+
+# Set security options
+if [ -n "$SECURITY_OPTIONS" ]; then /usr/sbin/postconf -e smtp_sasl_security_options=$SECURITY_OPTIONS; fi
+
+# Finish Postfix configuration
+/usr/sbin/postconf -e inet_protocols="$INET_PROTOCOLS"
+/usr/sbin/postconf -e smtpd_relay_restrictions="permit_mynetworks permit_sasl_authenticated defer_unauth_destination"
+
+# Make sure no permission problems happen
+/usr/sbin/postfix set-permissions
+
+_log "Docker entrypoint configured"
+
+# Start syslog daemon
+/etc/init.d/rsyslog restart
+
+# Start Postfix daemon
+/etc/init.d/postfix restart
+
+$@ & wait ${!}
